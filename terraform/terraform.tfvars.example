@@ -1,6 +1,8 @@
 ###############################################################################
 # Copy this file to terraform.tfvars and adjust the values for your setup.
 #   cp terraform.tfvars.example terraform.tfvars
+#
+# terraform.tfvars is gitignored — keep secrets and personal settings there.
 ###############################################################################
 
 aws_region   = "us-east-1"
@@ -17,34 +19,47 @@ ssh_key_name      = "" # e.g. "my-ec2-keypair"
 
 # --- Sizing -----------------------------------------------------------------
 # Modded servers need RAM. t3.large = 8GB, t3.xlarge = 16GB.
-instance_type       = "t3.large"
-server_memory       = "6G"
+# Leave ~4 GB headroom below instance RAM for the OS and Docker.
+instance_type       = "t3.xlarge"
+server_memory       = "12G"
 data_volume_size_gb = 30
 
 # --- Minecraft / mods -------------------------------------------------------
-mod_loader        = "FORGE" # FORGE | NEOFORGE | FABRIC | QUILT | PAPER | VANILLA
+# Loader must match every mod URL below.
+# FORGE | NEOFORGE | FABRIC | QUILT | PAPER | VANILLA
+mod_loader        = "FABRIC"
 minecraft_version = "1.20.1"
 
-# Direct download URLs to mod .jar files. They must target the same loader and
-# Minecraft version above. Example (CurseForge/Modrinth direct links):
+# Direct download URLs for mod .jar files (Modrinth / CurseForge CDN links).
+# Example: Fabric 1.20.1 with Time Controller (requires Fabric API).
 mod_urls = [
-  # "https://example.com/mods/jei-1.20.1-forge.jar",
+  "https://cdn.modrinth.com/data/P7dR8mSH/versions/hu6gukgT/fabric-api-0.92.9%2B1.20.1.jar",
+  "https://cdn.modrinth.com/data/HT32RjB5/versions/eYnGnT82/timecontrol-1.0.0%2B1.20.jar",
 ]
 
+# Extra jars appended when CurseForge modpack sync is enabled (see below).
+mod_urls_extra = []
+
 # --- CurseForge modpack sync (optional) -------------------------------------
-# When you create a modpack on CurseForge, set its project ID here and export
-# your API key before plan/apply:
+# When set (>0), mod URLs are resolved from a CurseForge modpack manifest
+# instead of mod_urls. Requires an API key in the environment:
 #   export CURSEFORGE_API_KEY="your-token"   # https://console.curseforge.com/
 #
-# Terraform reads the modpack manifest and resolves download URLs automatically.
-# Use mod_urls_extra for jars not in the pack (e.g. Modrinth-only mods).
 # curseforge_modpack_project_id = 123456
 # curseforge_modpack_file_id    = 0   # 0 = latest release for minecraft_version
 # mod_urls_extra = [
-#   "https://cdn.modrinth.com/data/.../some-modrinth-only-mod.jar",
+#   "https://cdn.modrinth.com/data/.../modrinth-only-mod.jar",
 # ]
+curseforge_modpack_project_id = 0
+curseforge_modpack_file_id    = 0
 
 motd        = "A modded Minecraft server, powered by Terraform"
 difficulty  = "normal"
 max_players = 20
-ops         = "" # e.g. "YourMinecraftUsername"
+ops         = ""          # Java Edition in-game name(s), comma-separated
+seed        = ""          # e.g. "51685503"; empty = random
+
+# --- Cost control -----------------------------------------------------------
+# Stop the EC2 instance after this many minutes with no players online.
+# Restart with: make start. Set to 0 to disable.
+idle_shutdown_minutes = 120
