@@ -1,0 +1,50 @@
+###############################################################################
+# Copy this file to terraform.tfvars and adjust the values for your setup.
+#   cp terraform.tfvars.example terraform.tfvars
+###############################################################################
+
+aws_region   = "us-east-1"
+project_name = "minecraft"
+
+# --- Access -----------------------------------------------------------------
+# Minecraft is open to the whole internet by default. Restrict if you want.
+# allowed_minecraft_cidrs = ["0.0.0.0/0"]
+
+# Lock SSH to your own IP. Find it with: curl ifconfig.me
+# Leave empty to disable SSH entirely (you can still use SSM Session Manager).
+allowed_ssh_cidrs = [] # e.g. ["203.0.113.7/32"]
+ssh_key_name      = "" # e.g. "my-ec2-keypair"
+
+# --- Sizing -----------------------------------------------------------------
+# Modded servers need RAM. t3.large = 8GB, t3.xlarge = 16GB.
+instance_type       = "t3.large"
+server_memory       = "6G"
+data_volume_size_gb = 30
+
+# --- Minecraft / mods -------------------------------------------------------
+mod_loader        = "FORGE" # FORGE | NEOFORGE | FABRIC | QUILT | PAPER | VANILLA
+minecraft_version = "1.20.1"
+
+# Direct download URLs to mod .jar files. They must target the same loader and
+# Minecraft version above. Example (CurseForge/Modrinth direct links):
+mod_urls = [
+  # "https://example.com/mods/jei-1.20.1-forge.jar",
+]
+
+# --- CurseForge modpack sync (optional) -------------------------------------
+# When you create a modpack on CurseForge, set its project ID here and export
+# your API key before plan/apply:
+#   export CURSEFORGE_API_KEY="your-token"   # https://console.curseforge.com/
+#
+# Terraform reads the modpack manifest and resolves download URLs automatically.
+# Use mod_urls_extra for jars not in the pack (e.g. Modrinth-only mods).
+# curseforge_modpack_project_id = 123456
+# curseforge_modpack_file_id    = 0   # 0 = latest release for minecraft_version
+# mod_urls_extra = [
+#   "https://cdn.modrinth.com/data/.../some-modrinth-only-mod.jar",
+# ]
+
+motd        = "A modded Minecraft server, powered by Terraform"
+difficulty  = "normal"
+max_players = 20
+ops         = "" # e.g. "YourMinecraftUsername"

@@ -1,0 +1,232 @@
+#!/bin/bash
+###############################################################################
+# Provisions an Amazon Linux 2023 instance to run a modded Minecraft server
+# via the itzg/minecraft-server Docker image.
+###############################################################################
+set -euo pipefail
+exec > >(tee /var/log/minecraft-setup.log) 2>&1
+
+echo "=== [$(date)] Starting Minecraft server provisioning ==="
+
+###############################################################################
+# 1. Install Docker + the Compose plugin
+###############################################################################
+dnf update -y
+dnf install -y docker
+
+mkdir -p /usr/local/lib/docker/cli-plugins
+COMPOSE_VERSION="v2.29.7"
+curl -fsSL \
+  "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/docker-compose-linux-$(uname -m)" \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+systemctl enable --now docker
+
+# AWS CLI is required to read the mod list from SSM Parameter Store.
+if ! command -v aws >/dev/null 2>&1; then
+  dnf install -y unzip
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install
+fi
+
+###############################################################################
+# 2. Locate, format (first boot only) and mount the persistent data volume.
+#    On Nitro instances EBS volumes appear as NVMe devices in a non-deterministic
+#    order, so we match by serial number, which equals the volume ID.
+###############################################################################
+VOLUME_ID="${data_volume_id}"
+SERIAL=$(echo "$${VOLUME_ID}" | tr -d '-')
+MOUNT_POINT="/opt/minecraft/data"
+
+DEVICE=""
+for attempt in $(seq 1 60); do
+  DEVICE=$(lsblk -dn -o NAME,SERIAL -p | awk -v s="$${SERIAL}" '$2 ~ s {print $1}' | head -n1)
+  if [ -n "$${DEVICE}" ]; then
+    echo "Found data volume at $${DEVICE} (serial $${SERIAL})"
+    break
+  fi
+  echo "Waiting for data volume ($${SERIAL}) to attach... ($${attempt})"
+  sleep 5
+done
+
+if [ -z "$${DEVICE}" ]; then
+  echo "ERROR: data volume $${VOLUME_ID} never appeared" >&2
+  exit 1
+fi
+
+if ! blkid "$${DEVICE}" >/dev/null 2>&1; then
+  echo "No filesystem detected on $${DEVICE}; creating xfs filesystem."
+  mkfs.xfs "$${DEVICE}"
+fi
+
+mkdir -p "$${MOUNT_POINT}"
+UUID=$(blkid -s UUID -o value "$${DEVICE}")
+if ! grep -q "$${UUID}" /etc/fstab; then
+  echo "UUID=$${UUID} $${MOUNT_POINT} xfs defaults,nofail 0 2" >> /etc/fstab
+fi
+mount -a
+
+# The itzg image runs as uid/gid 1000 by default.
+chown -R 1000:1000 "$${MOUNT_POINT}"
+
+###############################################################################
+# 3. Write the docker-compose definition.
+###############################################################################
+install -d /opt/minecraft
+cat > /opt/minecraft/docker-compose.yml <<COMPOSE
+services:
+  minecraft:
+    image: itzg/minecraft-server:${server_image_tag}
+    container_name: minecraft
+    restart: unless-stopped
+    ports:
+      - "${minecraft_port}:25565"
+    environment:
+      EULA: "TRUE"
+      TYPE: "${mod_loader}"
+      VERSION: "${minecraft_version}"
+      MEMORY: "${server_memory}"
+      MOTD: "${motd}"
+      DIFFICULTY: "${difficulty}"
+      MAX_PLAYERS: "${max_players}"
+      OPS: "${ops}"
+      SEED: "${seed}"
+      # Remove jars no longer in the list so the mods dir matches MODS exactly.
+      REMOVE_OLD_MODS: "TRUE"
+      ENABLE_AUTOPAUSE: "FALSE"
+      OVERRIDE_SERVER_PROPERTIES: "TRUE"
+    # MODS=<comma-separated urls> is sourced from this file, which is regenerated
+    # from the SSM parameter at boot and by refresh-mods.sh.
+    env_file:
+      - mods.env
+    volumes:
+      - /opt/minecraft/data:/data
+    healthcheck:
+      test: ["CMD", "mc-health"]
+      start_period: 5m
+      interval: 30s
+      retries: 10
+    stdin_open: true
+    tty: true
+COMPOSE
+
+###############################################################################
+# 3b. Mod sync: read the list from SSM and (re)write the compose env file.
+#     refresh-mods.sh is invoked on demand (by `terraform apply` via SSM Run
+#     Command, or manually) to apply mod changes without replacing the instance.
+###############################################################################
+cat > /opt/minecraft/refresh-mods.sh <<'REFRESH'
+#!/bin/bash
+set -euo pipefail
+REGION="${aws_region}"
+PARAM="${mod_param_name}"
+MODS=$(aws ssm get-parameter --region "$REGION" --name "$PARAM" --query 'Parameter.Value' --output text)
+[ "$MODS" = "None" ] && MODS=""
+echo "MODS=$MODS" > /opt/minecraft/mods.env
+cd /opt/minecraft
+# Recreate the container so the image re-syncs the mods dir to the new list.
+docker compose up -d --force-recreate
+echo "Mods refreshed: $${MODS:-<none>}"
+REFRESH
+chmod +x /opt/minecraft/refresh-mods.sh
+
+# Generate the initial env file before first start (systemd starts the server below).
+MODS_BOOT=$(aws ssm get-parameter --region "${aws_region}" --name "${mod_param_name}" --query 'Parameter.Value' --output text)
+[ "$${MODS_BOOT}" = "None" ] && MODS_BOOT=""
+echo "MODS=$${MODS_BOOT}" > /opt/minecraft/mods.env
+
+###############################################################################
+# 4. Run it as a systemd-managed service so it survives reboots.
+###############################################################################
+cat > /etc/systemd/system/minecraft.service <<'UNIT'
+[Unit]
+Description=Minecraft Server (docker compose)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/minecraft
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now minecraft.service
+
+###############################################################################
+# 5. Idle auto-shutdown: stop the EC2 instance after a period with no players
+#    online (saves compute cost). An OS shutdown moves an EBS-backed instance
+#    to the 'stopped' state; restart it with `make start`. No AWS creds needed.
+###############################################################################
+cat > /opt/minecraft/idle-shutdown.sh <<'IDLE'
+#!/bin/bash
+set -uo pipefail
+THRESHOLD_MIN=${idle_shutdown_minutes}
+[ "$THRESHOLD_MIN" -le 0 ] && exit 0
+
+STATE=/var/lib/minecraft-idle/last-active
+mkdir -p /var/lib/minecraft-idle
+now=$(date +%s)
+boot=$(date -d "$(uptime -s)" +%s)
+
+# Current online player count via RCON (e.g. "There are 0 of a max of 20 ...").
+players=$(docker exec minecraft rcon-cli list 2>/dev/null | grep -oE '[0-9]+' | head -1)
+[ -z "$players" ] && players=0
+
+if [ "$players" -gt 0 ]; then
+  echo "$now" > "$STATE"
+  exit 0
+fi
+
+# Empty server: measure idle time, but never count time before this boot
+# (so a fresh `make start` always gets a full grace period).
+file_last=$(cat "$STATE" 2>/dev/null || echo 0)
+last=$file_last
+[ "$boot" -gt "$last" ] && last=$boot
+idle_min=$(( (now - last) / 60 ))
+
+if [ "$idle_min" -ge "$THRESHOLD_MIN" ]; then
+  logger -t minecraft-idle "no players for $idle_min min (threshold $THRESHOLD_MIN); stopping instance"
+  /sbin/shutdown -h now
+fi
+IDLE
+chmod +x /opt/minecraft/idle-shutdown.sh
+
+cat > /etc/systemd/system/minecraft-idle.service <<'UNIT'
+[Unit]
+Description=Stop the instance when Minecraft has no players
+[Service]
+Type=oneshot
+ExecStart=/opt/minecraft/idle-shutdown.sh
+UNIT
+
+cat > /etc/systemd/system/minecraft-idle.timer <<'UNIT'
+[Unit]
+Description=Periodic Minecraft idle check
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+IDLE_MIN=${idle_shutdown_minutes}
+if [ "$IDLE_MIN" -gt 0 ]; then
+  systemctl enable --now minecraft-idle.timer
+  echo "Idle auto-shutdown enabled: stop after $IDLE_MIN min with no players."
+else
+  systemctl disable --now minecraft-idle.timer 2>/dev/null || true
+  echo "Idle auto-shutdown disabled."
+fi
+
+echo "=== [$(date)] Provisioning complete. Pulling image and starting world (first start can take several minutes). ==="

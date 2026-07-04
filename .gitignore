@@ -1,0 +1,22 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+# Keep the lock file committed (.terraform.lock.hcl) for reproducible provider versions.
+
+# SSH keys
+*.pem
+*.key
+
+# OS
+.DS_Store
